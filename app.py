@@ -15,6 +15,8 @@ import base64
 import os
 from datetime import timedelta
 
+import google.auth
+import google.auth.transport.requests
 from flask import Flask, request, jsonify
 from google.cloud import storage
 
@@ -27,6 +29,20 @@ OBJECT_PREFIX = "lfs/objects/"
 
 gcs_client = storage.Client()
 bucket = gcs_client.bucket(BUCKET_NAME)
+
+# On Cloud Run there's no private key — we use the IAM SignBlob API instead.
+# This requires roles/iam.serviceAccountTokenCreator on the service account.
+_credentials, _project = google.auth.default()
+_auth_request = google.auth.transport.requests.Request()
+_credentials.refresh(_auth_request)
+_sa_email = _credentials.service_account_email
+
+
+def _get_access_token() -> str:
+    """Return a fresh access token, refreshing if needed."""
+    if not _credentials.valid:
+        _credentials.refresh(_auth_request)
+    return _credentials.token
 
 
 def _check_write_auth() -> bool:
@@ -45,6 +61,20 @@ def _check_write_auth() -> bool:
 def _object_path(oid: str) -> str:
     """OID-based path with fan-out: lfs/objects/ab/cd/abcdef123456..."""
     return f"{OBJECT_PREFIX}{oid[:2]}/{oid[2:4]}/{oid}"
+
+
+def _signed_url(blob, method: str, content_type: str | None = None) -> str:
+    """Generate a V4 signed URL using the IAM SignBlob API."""
+    kwargs = {
+        "version": "v4",
+        "expiration": SIGNED_URL_EXPIRY,
+        "method": method,
+        "service_account_email": _sa_email,
+        "access_token": _get_access_token(),
+    }
+    if content_type:
+        kwargs["content_type"] = content_type
+    return blob.generate_signed_url(**kwargs)
 
 
 @app.route("/objects/batch", methods=["POST"])
@@ -75,11 +105,7 @@ def batch():
                 })
                 continue
 
-            url = blob.generate_signed_url(
-                version="v4",
-                expiration=SIGNED_URL_EXPIRY,
-                method="GET",
-            )
+            url = _signed_url(blob, "GET")
             response_objects.append({
                 "oid": oid,
                 "size": size,
@@ -104,12 +130,7 @@ def batch():
                     })
                     continue
 
-            url = blob.generate_signed_url(
-                version="v4",
-                expiration=SIGNED_URL_EXPIRY,
-                method="PUT",
-                content_type="application/octet-stream",
-            )
+            url = _signed_url(blob, "PUT", content_type="application/octet-stream")
 
             verify_url = f"{request.url_root.rstrip('/')}/objects/verify"
 
