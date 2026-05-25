@@ -132,7 +132,9 @@ def batch():
 
             url = _signed_url(blob, "PUT", content_type="application/octet-stream")
 
-            verify_url = f"{request.url_root.rstrip('/')}/objects/verify"
+            # Build verify URL — respect X-Forwarded-Proto from Cloud Run's proxy
+            scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+            verify_url = f"{scheme}://{request.host}/objects/verify"
 
             response_objects.append({
                 "oid": oid,
