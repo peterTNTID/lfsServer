@@ -23,6 +23,8 @@ import os
 import threading
 from datetime import timedelta
 
+from ipfs_cid import compute_cid_streaming
+
 import google.auth
 import google.auth.transport.requests
 from flask import Flask, request, jsonify, redirect
@@ -184,9 +186,35 @@ def verify():
     if blob.exists():
         blob.reload()
         if blob.size == size:
+            # Auto-compute IPFS CID in background
+            threading.Thread(
+                target=_auto_compute_cid, args=(oid, size),
+                daemon=True,
+            ).start()
             return "", 200
 
     return jsonify({"message": "Verification failed"}), 422
+
+
+def _auto_compute_cid(oid: str, size: int) -> None:
+    """Background task: compute CID for a newly uploaded object."""
+    try:
+        # Skip if already in manifest
+        with _manifest_lock:
+            already = any(info["oid"] == oid for info in _cid_to_oid.values())
+        if already:
+            return
+
+        blob = bucket.blob(_object_path(oid))
+        cid = compute_cid_streaming(blob, size)
+
+        with _manifest_lock:
+            _cid_to_oid[cid] = {"oid": oid, "size": size, "path": ""}
+
+        _save_manifest()
+        logging.info("Auto-computed CID for %s: %s", oid[:12], cid[:20])
+    except Exception as e:
+        logging.warning("Auto CID compute failed for %s: %s", oid[:12], e)
 
 
 # =============================================================================
@@ -315,6 +343,92 @@ def update_manifest():
         count = len(_cid_to_oid)
 
     return jsonify({"status": "ok", "entries": count})
+
+
+
+@app.route("/ipfs/reindex", methods=["POST"])
+def reindex():
+    """
+    Scan all LFS objects in GCS and compute IPFS CIDs server-side.
+
+    POST /ipfs/reindex
+    Authorization: Basic (same API key as LFS uploads)
+
+    This finds objects not yet in the manifest, downloads each one,
+    computes its CID using the same algorithm as `ipfs add`, and
+    updates the manifest. No local IPFS node is needed.
+    """
+    if not _check_write_auth():
+        return jsonify({"message": "Authentication required"}), 401
+
+    # Collect OIDs already in the manifest
+    with _manifest_lock:
+        known_oids = {info["oid"] for info in _cid_to_oid.values()}
+
+    # Scan GCS for all LFS objects
+    prefix = OBJECT_PREFIX
+    new_entries = 0
+    errors = 0
+
+    for blob in bucket.list_blobs(prefix=prefix):
+        # Path format: lfs/objects/xx/yy/<oid>
+        parts = blob.name.split("/")
+        if len(parts) != 5:
+            continue
+        oid = parts[4]
+
+        if oid in known_oids:
+            continue
+
+        try:
+            blob.reload()
+            cid = compute_cid_streaming(blob, blob.size)
+
+            with _manifest_lock:
+                _cid_to_oid[cid] = {
+                    "oid": oid,
+                    "size": blob.size,
+                    "path": "",
+                }
+            new_entries += 1
+            logging.info("Reindex: %s -> %s", oid[:12], cid[:20])
+        except Exception as e:
+            errors += 1
+            logging.warning("Reindex failed for %s: %s", oid[:12], e)
+
+    # Save updated manifest to GCS
+    if new_entries > 0:
+        _save_manifest()
+
+    with _manifest_lock:
+        total = len(_cid_to_oid)
+
+    return jsonify({
+        "status": "ok",
+        "new_entries": new_entries,
+        "errors": errors,
+        "total_entries": total,
+    })
+
+
+def _save_manifest() -> None:
+    """Persist the in-memory CID→OID mapping to GCS."""
+    with _manifest_lock:
+        data = [
+            {
+                "ipfs_cid": cid,
+                "lfs_oid": f"sha256:{info['oid']}",
+                "size": info["size"],
+                "path": info["path"],
+            }
+            for cid, info in _cid_to_oid.items()
+        ]
+    blob = bucket.blob(MANIFEST_PATH)
+    blob.upload_from_string(
+        json.dumps(data, separators=(",", ":")),
+        content_type="application/json",
+    )
+    logging.info("Manifest saved to GCS: %d entries.", len(data))
 
 
 @app.route("/", methods=["GET"])

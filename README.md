@@ -206,19 +206,29 @@ object fetches. The advantage: zero additional cost, files are always available
 | `GET` | `/ipfs/<cid>` | None | Resolve CID → GCS signed URL (302 redirect) |
 | `GET` | `/ipfs/manifest` | None | Return the current CID→OID manifest as JSON |
 | `POST` | `/ipfs/manifest` | API key | Upload/sync the manifest from a client repo |
+| `POST` | `/ipfs/reindex` | API key | Scan GCS, compute CIDs server-side, update manifest |
 
-### Syncing the manifest
+### Automatic CID computation
 
-The CID→OID mapping is stored in GCS at `lfs/ipfs-manifest.json` and loaded
-into memory on startup. To update it, push from your repo:
+CIDs are computed **automatically** — no local IPFS node required:
 
-```bash
-# From the nozzles repo (or any repo using this LFS server):
-./tools/sync-manifest.sh
-```
+1. **On upload**: When `git lfs push` verifies an upload, the server computes
+   the IPFS CID in the background and adds it to the manifest. This happens
+   after every `git push` with new LFS files.
 
-This converts `.ipfs/manifest.jsonl` to a JSON array and POSTs it to
-`/ipfs/manifest` using the same LFS API key credentials.
+2. **Bulk reindex**: For existing files or catching up, POST to `/ipfs/reindex`:
+   ```bash
+   curl -X POST https://lfs-server-183374654452.australia-southeast1.run.app/ipfs/reindex \
+     -u lfs:$API_KEY
+   # → {"status":"ok","new_entries":15,"errors":0,"total_entries":334}
+   ```
+
+The CID computation is pure Python — identical to `ipfs add --cid-version=1
+--raw-leaves`. No Kubo installation, no IPFS daemon.
+
+### Manual manifest sync (optional)
+
+You can also push a manifest from the client repo:
 
 ### Example usage
 
