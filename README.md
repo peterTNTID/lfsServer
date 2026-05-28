@@ -172,6 +172,96 @@ With scale-to-zero on Cloud Run, costs are essentially just storage:
 | 1 TB | ~$26/month |
 | Cloud Run (scale-to-zero) | ~$0.00/month |
 
+---
+
+## IPFS Gateway
+
+The server doubles as an **IPFS HTTP Gateway**, serving LFS objects by IPFS CID.
+No additional infrastructure — it maps CIDs to LFS OIDs and redirects to GCS.
+
+### How it works
+
+```
+GET /ipfs/bafybei...
+    │
+    ▼
+Look up CID → OID           ← in-memory manifest (loaded from GCS)
+    │
+    ▼
+Generate GCS signed URL      ← same mechanism as LFS downloads
+    │
+    ▼
+302 Redirect → GCS           ← client downloads directly from GCS
+```
+
+This is **not** a full IPFS peer node — it doesn't participate in the DHT or
+swarm. It's a lightweight HTTP gateway that translates CID requests into GCS
+object fetches. The advantage: zero additional cost, files are always available
+(GCS durability), and it scales to zero just like the LFS server.
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/ipfs/<cid>` | None | Resolve CID → GCS signed URL (302 redirect) |
+| `GET` | `/ipfs/manifest` | None | Return the current CID→OID manifest as JSON |
+| `POST` | `/ipfs/manifest` | API key | Upload/sync the manifest from a client repo |
+
+### Syncing the manifest
+
+The CID→OID mapping is stored in GCS at `lfs/ipfs-manifest.json` and loaded
+into memory on startup. To update it, push from your repo:
+
+```bash
+# From the nozzles repo (or any repo using this LFS server):
+./tools/sync-manifest.sh
+```
+
+This converts `.ipfs/manifest.jsonl` to a JSON array and POSTs it to
+`/ipfs/manifest` using the same LFS API key credentials.
+
+### Example usage
+
+The gateway is live. Anyone can fetch files by IPFS CID — no auth, no IPFS
+node required:
+
+```bash
+# Download a WAV file by CID (302 redirects to GCS signed URL)
+curl -L https://lfs-server-183374654452.australia-southeast1.run.app/ipfs/bafkreiawia53opmgi26wcjglj6koz7k4hi6yabqdqytgojjypsqxx3rv2a \
+  -o "10 - Keys #05.wav"
+
+# Download a larger file (46.6 MB)
+curl -L https://lfs-server-183374654452.australia-southeast1.run.app/ipfs/bafybeibnew6cl3v3b7auj2rmj6i2fnc3fmbzgeh74qsoo7fizq5duodsuu \
+  -o "10 - Keys #18.wav"
+
+# Open in a browser (will start downloading)
+open "https://lfs-server-183374654452.australia-southeast1.run.app/ipfs/bafkreiawia53opmgi26wcjglj6koz7k4hi6yabqdqytgojjypsqxx3rv2a"
+
+# Check the health endpoint (shows CID count)
+curl https://lfs-server-183374654452.australia-southeast1.run.app/
+# → {"ipfs_gateway":{"cid_count":319,"enabled":true},"service":"git-lfs-gcs","status":"ok"}
+
+# Browse the full manifest
+curl https://lfs-server-183374654452.australia-southeast1.run.app/ipfs/manifest | jq '.[0:3]'
+
+# Look up a specific file
+curl -s https://lfs-server-183374654452.australia-southeast1.run.app/ipfs/manifest \
+  | jq '.[] | select(.path | contains("Keys #05"))'
+```
+
+### Live gateway URL format
+
+```
+https://lfs-server-183374654452.australia-southeast1.run.app/ipfs/<CID>
+```
+
+The CID is the IPFS content identifier — a string starting with `bafybei...`
+(DAG-PB, for files > 256 KiB) or `bafkrei...` (raw, for files ≤ 256 KiB).
+You can find CIDs in the manifest at `/ipfs/manifest` or in the client
+repo's `.ipfs/manifest.jsonl`.
+
+---
+
 ## Local Development
 
 ```bash

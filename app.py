@@ -1,23 +1,31 @@
 """
 Minimal Git LFS server — GCS signed URLs, API key auth for writes.
+Also serves as an IPFS HTTP Gateway, mapping IPFS CIDs to LFS objects in GCS.
 
 Implements the Git LFS Batch API:
 https://github.com/git-lfs/git-lfs/blob/main/docs/api/batch.md
+
+IPFS Gateway:
+  GET /ipfs/<cid>  — looks up CID → LFS OID, redirects to GCS signed URL
 
 Flow:
   1. git-lfs POSTs to /objects/batch with a list of OIDs + operation
   2. For uploads: server checks API key, returns GCS signed upload URLs
   3. For downloads: no auth needed, returns GCS signed download URLs
   4. git-lfs uploads/downloads directly to/from GCS (server never touches file data)
+  5. IPFS gateway: CID lookups redirect to GCS via the same signed URL mechanism
 """
 
 import base64
+import json
+import logging
 import os
+import threading
 from datetime import timedelta
 
 import google.auth
 import google.auth.transport.requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from google.cloud import storage
 
 app = Flask(__name__)
@@ -26,6 +34,7 @@ BUCKET_NAME = os.environ.get("GCS_BUCKET", "")
 API_KEY = os.environ.get("LFS_WRITE_API_KEY", "")
 SIGNED_URL_EXPIRY = timedelta(hours=1)
 OBJECT_PREFIX = "lfs/objects/"
+MANIFEST_PATH = "lfs/ipfs-manifest.json"  # CID→OID mapping stored in GCS
 
 gcs_client = storage.Client()
 bucket = gcs_client.bucket(BUCKET_NAME)
@@ -180,10 +189,148 @@ def verify():
     return jsonify({"message": "Verification failed"}), 422
 
 
+# =============================================================================
+# IPFS Gateway — serve LFS objects by IPFS CID
+# =============================================================================
+
+# In-memory CID → OID lookup, loaded from GCS manifest
+_cid_to_oid: dict[str, dict] = {}  # {cid: {"oid": str, "size": int, "path": str}}
+_manifest_lock = threading.Lock()
+
+
+def _load_manifest() -> None:
+    """Load the CID→OID mapping from GCS into memory."""
+    global _cid_to_oid
+    blob = bucket.blob(MANIFEST_PATH)
+    if not blob.exists():
+        logging.info("No IPFS manifest found in GCS — gateway has no mappings.")
+        return
+
+    data = json.loads(blob.download_as_text())
+    mapping = {}
+    for entry in data:
+        cid = entry.get("ipfs_cid", "")
+        oid = entry.get("lfs_oid", "").removeprefix("sha256:")
+        if cid and oid:
+            mapping[cid] = {
+                "oid": oid,
+                "size": entry.get("size", 0),
+                "path": entry.get("path", ""),
+            }
+    with _manifest_lock:
+        _cid_to_oid = mapping
+    logging.info("IPFS manifest loaded: %d CID→OID mappings.", len(mapping))
+
+
+# Load manifest on startup (non-blocking — server starts even if manifest is missing)
+try:
+    _load_manifest()
+except Exception as e:
+    logging.warning("Failed to load IPFS manifest on startup: %s", e)
+
+
+@app.route("/ipfs/<cid>", methods=["GET"])
+def ipfs_gateway(cid: str):
+    """
+    IPFS HTTP Gateway — resolve a CID to a GCS signed URL.
+
+    GET /ipfs/bafybei...
+      → 302 redirect to GCS signed download URL
+
+    This is not a full IPFS node — it's a stateless gateway that translates
+    CID requests into GCS fetches via the LFS object store.
+    """
+    with _manifest_lock:
+        entry = _cid_to_oid.get(cid)
+
+    if not entry:
+        return jsonify({
+            "error": "CID not found",
+            "cid": cid,
+            "hint": "This gateway only serves CIDs listed in the IPFS manifest. "
+                    "POST to /ipfs/manifest to update the mapping.",
+        }), 404
+
+    oid = entry["oid"]
+    blob = bucket.blob(_object_path(oid))
+
+    if not blob.exists():
+        return jsonify({
+            "error": "LFS object not found in storage",
+            "cid": cid,
+            "oid": oid,
+        }), 404
+
+    # Generate a signed download URL and redirect
+    url = _signed_url(blob, "GET")
+    return redirect(url, code=302)
+
+
+@app.route("/ipfs/manifest", methods=["GET"])
+def get_manifest():
+    """
+    Return the current CID→OID manifest.
+
+    GET /ipfs/manifest
+      → JSON array of {ipfs_cid, lfs_oid, size, path}
+    """
+    with _manifest_lock:
+        entries = [
+            {"ipfs_cid": cid, "lfs_oid": f"sha256:{info['oid']}",
+             "size": info["size"], "path": info["path"]}
+            for cid, info in _cid_to_oid.items()
+        ]
+    return jsonify(entries)
+
+
+@app.route("/ipfs/manifest", methods=["POST"])
+def update_manifest():
+    """
+    Upload/sync the CID→OID manifest.
+
+    POST /ipfs/manifest
+    Authorization: Basic (same API key as LFS uploads)
+    Body: JSON array from .ipfs/manifest.jsonl (parsed as array)
+
+    This stores the manifest in GCS and reloads the in-memory mapping.
+    """
+    if not _check_write_auth():
+        return jsonify({"message": "Authentication required"}), 401
+
+    data = request.get_json()
+    if not isinstance(data, list):
+        return jsonify({"error": "Expected a JSON array of manifest entries"}), 400
+
+    # Store in GCS
+    blob = bucket.blob(MANIFEST_PATH)
+    blob.upload_from_string(
+        json.dumps(data, separators=(",", ":")),
+        content_type="application/json",
+    )
+
+    # Reload in-memory mapping
+    _load_manifest()
+
+    with _manifest_lock:
+        count = len(_cid_to_oid)
+
+    return jsonify({"status": "ok", "entries": count})
+
+
 @app.route("/", methods=["GET"])
 def health():
     """Health check endpoint."""
-    return jsonify({"status": "ok", "service": "git-lfs-gcs"})
+    with _manifest_lock:
+        cid_count = len(_cid_to_oid)
+    return jsonify({
+        "status": "ok",
+        "service": "git-lfs-gcs",
+        "ipfs_gateway": {
+            "enabled": True,
+            "cid_count": cid_count,
+            "endpoint": "/ipfs/<cid>",
+        },
+    })
 
 
 if __name__ == "__main__":
